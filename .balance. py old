@@ -1,0 +1,328 @@
+from telegram.ext import CommandHandler
+from Grabber import application, user_collection
+from telegram import Update
+from datetime import datetime, timedelta
+import asyncio
+# Dictionary to store last payment times
+last_payment_times = {}
+
+async def balance(update, context):
+    # Check if the user is replying to a message
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        tagged_user_id = update.message.reply_to_message.from_user.id
+
+        # Retrieve tagged user balance from the database (replace this with your actual database query)
+        tagged_user_balance = await user_collection.find_one({'id': tagged_user_id}, projection={'balance': 1})
+
+        if tagged_user_balance:
+            balance_amount = tagged_user_balance.get('balance', 0)
+            formatted_balance = "Ŧ{:,.0f}".format(balance_amount)  # Format the balance with the specified font
+            balance_message = f"{update.effective_user.mention_markdown_v2()} tagged user's current balance is: {formatted_balance}"
+        else:
+            balance_message = "Tagged user hasn't picked any waifus yet."
+    else:
+        # Retrieve user balance from the database (replace this with your actual database query)
+        user_id = update.effective_user.id
+        user_balance = await user_collection.find_one({'id': user_id}, projection={'balance': 1})
+
+        if user_balance:
+            balance_amount = user_balance.get('balance', 0)
+            formatted_balance = "Ŧ{:,.0f}".format(balance_amount)  # Format the balance with the specified font
+            balance_message = f"Your current balance is: {formatted_balance}"
+        else:
+            balance_message = "You haven't picked any waifus yet."
+
+    await update.message.reply_text(balance_message)
+
+    
+async def pay(update, context):
+    sender_id = update.effective_user.id
+
+    # Check if the command was a reply
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Please reply to a user to /pay.")
+        return
+
+    # Extract the recipient's user ID
+    recipient_id = update.message.reply_to_message.from_user.id
+
+    # Prevent user from paying themselves
+    if sender_id == recipient_id:
+        await update.message.reply_text("You can't pay yourself.")
+        return
+
+    # Parse the amount from the command
+    try:
+        amount = int(context.args[0])
+        if amount <= 0:
+            raise ValueError("Amount must be greater than zero.")
+        if amount > 10000000:
+            raise ValueError("You can't pay more than 100000 Tokens at once.")
+    except (IndexError, ValueError):
+        await update.message.reply_text("you are only pay 10000000 tokens")
+        return
+
+    # Check if the sender has enough balance
+    sender_balance = await user_collection.find_one({'id': sender_id}, projection={'balance': 1})
+    if not sender_balance or sender_balance.get('balance', 0) < amount:
+        await update.message.reply_text("Insufficient balance to make the payment.")
+        return
+
+    # Check last payment time and cooldown
+    last_payment_time = last_payment_times.get(sender_id)
+    if last_payment_time:
+        time_since_last_payment = datetime.now() - last_payment_time
+        if time_since_last_payment < timedelta(minutes=10):
+            cooldown_time = timedelta(minutes=10) - time_since_last_payment
+            formatted_cooldown = format_timedelta(cooldown_time)
+            await update.message.reply_text(f"Cooldown! You can pay again in `{formatted_cooldown}`.")
+            return
+
+    # Perform the payment
+    await user_collection.update_one({'id': sender_id}, {'$inc': {'balance': -amount}})
+    await user_collection.update_one({'id': recipient_id}, {'$inc': {'balance': amount}})
+
+    # Update last payment time
+    last_payment_times[sender_id] = datetime.now()
+
+    # Fetch updated sender balance
+    updated_sender_balance = await user_collection.find_one({'id': sender_id}, projection={'balance': 1})
+
+    # Reply with payment success and updated balance
+    await update.message.reply_text(
+        f"Payment Successful! You Paid {amount} Tokens to {update.message.reply_to_message.from_user.username}. "
+    )
+
+
+async def mtop(update, context):
+    # Retrieve the top 10 users with the highest balance
+    top_users = await user_collection.find({}, projection={'id': 1, 'first_name': 1, 'last_name': 1, 'balance': 1}).sort('balance', -1).limit(10).to_list(10)
+
+    # Create a message with the top users
+    top_users_message = "Top 10 Users With Highest Tokens\n\n"
+    for i, user in enumerate(top_users, start=1):
+        first_name = user.get('first_name', 'Unknown')
+        last_name = user.get('last_name', '')
+        user_id = user.get('id', 'Unknown')
+
+        # Concatenate first_name and last_name if last_name is available
+        full_name = f"{first_name} {last_name}" if last_name else first_name
+
+        top_users_message += f"{i}. <a href='tg://user?id={user_id}'>{full_name}</a>, 💸{user.get('balance', 0)} Tokens\n"
+    # Send the photo and include the top_users_message in the caption
+    photo_path = 'https://te.legra.ph/file/ce017c623256a631be42f.jpg'
+    await update.message.reply_photo(photo=photo_path, caption=top_users_message, parse_mode='HTML')
+
+
+   
+async def daily_reward(update, context):
+    user_id = update.effective_user.id
+
+    # Check if the user already claimed the daily reward today
+    user_data = await user_collection.find_one({'id': user_id}, projection={'last_daily_reward': 1, 'balance': 1})
+
+    if user_data:
+        last_claimed_date = user_data.get('last_daily_reward')
+
+        if last_claimed_date and last_claimed_date.date() == datetime.utcnow().date():
+            time_since_last_claim = datetime.utcnow() - last_claimed_date
+            time_until_next_claim = timedelta(days=1) - time_since_last_claim
+            formatted_time_until_next_claim = format_timedelta(time_until_next_claim)
+            await update.message.reply_text(f"You already claimed your today's reward. Come back Tomorrow!\nTime Until Next Claim: `{formatted_time_until_next_claim}`.")
+            return
+
+    await user_collection.update_one(
+        {'id': user_id},
+        {'$inc': {'balance': 30000}, '$set': {'last_daily_reward': datetime.utcnow()}}
+    )
+
+    await update.message.reply_text("bro come back Congratulations! You claimed  Ŧ30.KTokens")
+
+
+def format_timedelta(td: timedelta) -> str:
+    seconds = td.total_seconds()
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return "{:02}h {:02}m {:02}s".format(int(hours), int(minutes), int(seconds))
+
+
+from datetime import datetime, timedelta
+
+import random
+from datetime import datetime, timedelta
+
+from telegram.ext import CommandHandler
+from Grabber import application, user_collection
+from telegram import Update
+
+async def sbet(update, context):
+    # Parse the amount and choice from the command
+    try:
+        amount = int(context.args[0])
+        choice = context.args[1].upper()  # Convert the choice to uppercase for consistency
+        if amount <= 0:
+            raise ValueError("Amount must be greater than zero.")
+        if choice not in ['H', 'T']:
+            raise ValueError("Invalid choice. Use 'H' for Head or 'T' for Tail.")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Use /sbet <amount> <H or T>")
+        return
+    
+    user_id = update.effective_user.id
+    user_balance = await user_collection.find_one({'id': user_id}, projection={'balance': 1})
+
+    if not user_balance or user_balance.get('balance', 0) < amount:
+        await update.message.reply_text("Insufficient balance to make the bet.")
+        return
+    
+    # Coin landing randomly on head or tail
+    coin_landing = random.choice(["H", "T"])
+    
+    # User wins if their choice matches the coin's landing
+    if choice == coin_landing:
+        won_amount = 2 * amount
+        await user_collection.update_one({'id': user_id}, {'$inc': {'balance': won_amount + amount}})
+        updated_balance = user_balance.get('balance', 0) + won_amount
+        message = f"You chose {'Head' if choice == 'H' else 'Tail'} and won Ŧ{won_amount:,.0f}.\nCoin landed on {coin_landing}."
+    else:
+        await user_collection.update_one({'id': user_id}, {'$inc': {'balance': -amount}})
+        updated_balance = user_balance.get('balance', 0) - amount
+        message = f"You chose {'Head' if choice == 'H' else 'Tail'} and lost Ŧ{amount:,.0f}.\nCoin landed on {coin_landing}."
+    
+    # Send the text message first
+    await update.message.reply_text(message)
+    
+    # Then send the photo
+    await update.message.reply_photo(
+        photo='https://graph.org/file/ea16e9974b1b07171bc84.jpg',
+        caption="Here is the coin toss result."
+    )
+
+from telegram import Update
+from telegram.ext import CommandHandler
+import random
+import asyncio
+from datetime import datetime, timedelta
+from Grabber import application, user_collection
+
+# Define a dictionary to keep track of users' last shunt time
+last_shunt_time = {}
+
+# List of monster names
+monster_names = [
+    "Goblin", "Orc", "Troll", "Dragon", "Skeleton", "Witch", "Vampire", "Werewolf",
+    "Cyclops", "Minotaur", "Banshee", "Ghost", "Zombie", "Specter", "Manticore",
+    "Hydra", "Siren", "Basilisk", "Chimera", "Kraken", "Phoenix", "Yeti", "Griffin",
+    "Cerberus", "Harpy", "Wendigo", "Behemoth", "Cthulhu", "Medusa", "Gorgon",
+    "Necromancer", "Warlock", "Lich", "Demon", "Djinn", "Fairy"
+]
+
+# Command handler for /shunt
+async def shunt(update: Update, context):
+    user_id = update.effective_user.id
+    current_time = datetime.now()
+
+    # Check if the user is on cooldown
+    if user_id in last_shunt_time:
+        time_since_last_shunt = current_time - last_shunt_time[user_id]
+        cooldown_remaining = timedelta(seconds=30) - time_since_last_shunt
+        if cooldown_remaining > timedelta(seconds=0):
+            await update.message.reply_text(f"Please wait {cooldown_remaining.seconds} seconds before using shunt again.")
+            return
+
+    async def send_shunt_result():
+        monster_name = random.choice(monster_names)
+        rank = random.choice(['F', 'E', 'D', 'C', 'B', 'A', 'S'])
+        event = f"You found an [ {rank} ] Rank {monster_name} Dungeon."
+        # Deduct 1000 tokens from the user's balance
+        await user_collection.update_one({'id': user_id}, {'$inc': {'balance': -1000}})
+        # Randomly determine if the user wins or loses
+        if random.choice([True, False]):
+            won_tokens = random.randint(100, 10000)
+            # Update user balance with won tokens
+            await user_collection.update_one({'id': user_id}, {'$inc': {'balance': won_tokens}})
+            result_message = f"You won the fight! You got these items:\n\nGold: {won_tokens}"
+        else:
+            result_message = "You lost💀.\nAnd Goblin Fucked your Beast💀."
+        # Randomly select a portal image
+        portal_img = random.choice([
+            "https://telegra.ph/file/3a78c07b81541f5d56f3b.jpg",
+            "https://telegra.ph/file/9d0f0b14b145bf559198e.jpg",
+            "https://telegra.ph/file/f45ad6de6e643ea1fe40f.jpg"
+        ])
+        # Send the image along with the result message
+        await context.bot.send_photo(update.effective_chat.id, photo=portal_img, caption=f"Result:\n\n{event}\n\n{result_message}")
+        # Update last shunt time for the user
+        last_shunt_time[user_id] = datetime.now()
+
+    # Execute shunt function
+    await send_shunt_result()
+
+
+
+
+import asyncio
+from telegram.ext import CommandHandler
+from Grabber import application, user_collection
+from telegram import Update
+import random
+from datetime import datetime, timedelta
+
+# Dictionary to store last propose times
+last_propose_times = {}
+
+async def propose(update, context):
+    # Check if the user has 20000 tokens
+    user_id = update.effective_user.id
+    user_balance = await user_collection.find_one({'id': user_id}, projection={'balance': 1})
+
+    if not user_balance or user_balance.get('balance', 0) < 20000:
+        await update.message.reply_text("You need at least 20000 tokens to propose.")
+        return
+
+    # Check last propose time and cooldown
+    last_propose_time = last_propose_times.get(user_id)
+    if last_propose_time:
+        time_since_last_propose = datetime.now() - last_propose_time
+        if time_since_last_propose < timedelta(minutes=5):
+            remaining_cooldown = timedelta(minutes=5) - time_since_last_propose
+            remaining_cooldown_minutes = remaining_cooldown.total_seconds() // 60
+            remaining_cooldown_seconds = remaining_cooldown.total_seconds() % 60
+            await update.message.reply_text(f"Cooldown! Please wait {int(remaining_cooldown_minutes)}m {int(remaining_cooldown_seconds)}s before proposing again.")
+            return
+
+    # Deduct the propose fee of 10000 tokens
+    await user_collection.update_one({'id': user_id}, {'$inc': {'balance': -10000}})
+
+    # Send the proposal message with a photo path
+    proposal_message = "✨ 𝐅𝐢𝐧𝐚𝐥𝐥𝐲 𝐭𝐡𝐞 𝐭𝐢𝐦𝐞 𝐡𝐚𝐬 𝐜𝐨𝐦𝐞 ✨"
+    photo_path = 'https://graph.org/file/deda08aefd8c0e1540fcd.jpg'  # Replace with your photo path
+    await update.message.reply_photo(photo=photo_path, caption=proposal_message)
+    
+    await asyncio.sleep(2)  # 2-second delay
+
+    # Send the proposal text
+    await update.message.reply_text("𝐏𝐫𝐨𝐩𝐨𝐬𝐞𝐢𝐧𝐠 𝐡𝐞𝐫 💍")
+
+    await asyncio.sleep(2)  # 2-second delay
+
+    # Generate a random result (60% chance of rejection, 40% chance of acceptance)
+    if random.random() < 0.6:
+        rejection_message = "𝐒𝐡𝐞 𝐬𝐥𝐚𝐩𝐩𝐞𝐝 𝐲𝐨𝐮 𝐚𝐧𝐝 𝐫𝐮𝐧 𝐚𝐰𝐚𝐲😂"
+        rejection_photo_path = 'https://graph.org/file/3e392dc74f4b428828664.jpg'  # Replace with rejection photo path
+        await update.message.reply_photo(photo=rejection_photo_path, caption=rejection_message)
+    else:
+        await update.message.reply_text("Congratulations! She accepted you.")
+
+    # Update last propose time
+    last_propose_times[user_id] = datetime.now()
+
+# Add the CommandHandler to the application
+application.add_handler(CommandHandler("propose", propose, block=False))
+application.add_handler(CommandHandler("shunt", shunt, block=False)) 
+
+application.add_handler(CommandHandler("sbet", sbet, block=False))
+application.add_handler(CommandHandler("claim", daily_reward, block=False))
+application.add_handler(CommandHandler("bal", balance, block=False))
+application.add_handler(CommandHandler("pay", pay, block=False))
+application.add_handler(CommandHandler("tops", mtop, block=False))
